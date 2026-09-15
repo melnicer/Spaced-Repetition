@@ -5,18 +5,6 @@ from app.config import settings
 if settings.GEMINI_API_KEY:
     genai.configure(api_key=settings.GEMINI_API_KEY)
 
-def get_gemini_model():
-    try:
-        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        flash_models = [m for m in models if 'flash' in m.lower()]
-        if flash_models:
-            return genai.GenerativeModel(flash_models[0])
-        elif models:
-            return genai.GenerativeModel(models[0])
-    except Exception:
-        pass
-    return genai.GenerativeModel("gemini-3.6-flash")
-
 def generate_flashcard_deck(raw_text: str, title: str) -> dict:
     if not settings.GEMINI_API_KEY:
         # Fallback dummy deck if API key is not set (useful for local dev/testing)
@@ -36,7 +24,7 @@ def generate_flashcard_deck(raw_text: str, title: str) -> dict:
             ]
         }
 
-    model = get_gemini_model()
+    model = genai.GenerativeModel("gemini-3.5-flash")
     prompt = f"""
 You are an expert AI study assistant. Convert the following raw study notes or document text into a concise, high-yield flashcard deck.
 Return ONLY valid JSON matching this exact structure:
