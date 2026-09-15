@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: flutterstudy-api
+    env: docker
+    plan: free
+    buildCommand: ""
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
