@@ -16,7 +16,7 @@ def get_gemini_model():
             return genai.GenerativeModel(models[0])
     except Exception:
         pass
-    return genai.GenerativeModel("gemini-1.5-flash")
+    return genai.GenerativeModel("gemini-3.6-flash")
 
 def remediate_leeches(cards: list[LeechCardIn]) -> list[RemediatedCardOut]:
     if not settings.GEMINI_API_KEY:
