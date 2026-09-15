@@ -6,6 +6,18 @@ from app.models.schemas import LeechCardIn, RemediatedCardOut
 if settings.GEMINI_API_KEY:
     genai.configure(api_key=settings.GEMINI_API_KEY)
 
+def get_gemini_model():
+    try:
+        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        flash_models = [m for m in models if 'flash' in m.lower()]
+        if flash_models:
+            return genai.GenerativeModel(flash_models[0])
+        elif models:
+            return genai.GenerativeModel(models[0])
+    except Exception:
+        pass
+    return genai.GenerativeModel("gemini-1.5-flash")
+
 def remediate_leeches(cards: list[LeechCardIn]) -> list[RemediatedCardOut]:
     if not settings.GEMINI_API_KEY:
         # Fallback dummy remediation if API key not set
@@ -21,7 +33,7 @@ def remediate_leeches(cards: list[LeechCardIn]) -> list[RemediatedCardOut]:
             ))
         return results
 
-    model = genai.GenerativeModel("gemini-3.5-flash")
+    model = get_gemini_model()
     
     cards_payload = [{"id": c.id, "question": c.question, "answer": c.answer, "streak": c.streak} for c in cards]
     
