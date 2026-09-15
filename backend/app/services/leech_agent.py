@@ -21,7 +21,7 @@ def remediate_leeches(cards: list[LeechCardIn]) -> list[RemediatedCardOut]:
             ))
         return results
 
-    model = genai.GenerativeModel("gemini-1.5-flash-latest")
+    model = genai.GenerativeModel("gemini-3.5-flash")
     
     cards_payload = [{"id": c.id, "question": c.question, "answer": c.answer, "streak": c.streak} for c in cards]
     

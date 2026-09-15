@@ -24,7 +24,7 @@ def generate_flashcard_deck(raw_text: str, title: str) -> dict:
             ]
         }
 
-    model = genai.GenerativeModel("gemini-1.5-flash-latest")
+    model = genai.GenerativeModel("gemini-3.5-flash")
     prompt = f"""
 You are an expert AI study assistant. Convert the following raw study notes or document text into a concise, high-yield flashcard deck.
 Return ONLY valid JSON matching this exact structure:
