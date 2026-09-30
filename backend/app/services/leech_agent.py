@@ -1,75 +1,155 @@
+"""Leech remediation via the provider pool, with disk caching."""
+
 import json
-import google.generativeai as genai
+import logging
+
 from app.config import settings
-from app.models.schemas import LeechCardIn, RemediatedCardOut
+from app.models.schemas import (
+    FlashcardOut,
+    LeechCardIn,
+    RemediatedCardOut,
+    RemediationAction,
+    RemediationSchema,
+)
+from app.services.cache import ResponseCache
+from app.services.providers.pool import get_pool
 
-if settings.GEMINI_API_KEY:
-    genai.configure(api_key=settings.GEMINI_API_KEY)
+logger = logging.getLogger(__name__)
 
-def remediate_leeches(cards: list[LeechCardIn]) -> list[RemediatedCardOut]:
-    if not settings.GEMINI_API_KEY:
-        # Fallback dummy remediation if API key not set
-        results = []
-        for c in cards:
-            results.append(RemediatedCardOut(
-                id=c.id,
-                action="rewritten",
-                new_question=f"Simplified: {c.question}",
-                new_answer=f"Simplified: {c.answer}",
-                mnemonic="Fallback mnemonic: Think of simpler terms.",
-                reason="Fallback mock remediation applied because GEMINI_API_KEY is not configured."
-            ))
-        return results
+PROMPT = """You repair flashcards a student keeps failing.
 
-    model = genai.GenerativeModel("gemini-3.5-flash")
-    
-    cards_payload = [{"id": c.id, "question": c.question, "answer": c.answer, "streak": c.streak} for c in cards]
-    
-    prompt = f"""
-You are an expert Spaced Repetition AI agent. The user has repeatedly failed (failure streak >= 3) on the following flashcards (leeches).
-For each card, analyze why it might be difficult (too dense, multi-concept, or abstract) and apply one of three remediation strategies:
-1. "rewritten": Rewrite the wording to be simpler and clearer.
-2. "split": Split a multi-concept question into simpler components (provide the first sub-card or simplified question/answer).
-3. "mnemonic": Add a powerful mnemonic memory hint.
+For each card, diagnose the problem and apply exactly one remedy:
 
-Return ONLY valid JSON with this exact structure:
-{{
-  "remediated_cards": [
-    {{
-      "id": "card_id_here",
-      "action": "rewritten" | "split" | "mnemonic",
-      "new_question": "...",
-      "new_answer": "...",
-      "mnemonic": "...",
-      "reason": "..."
-    }}
-  ]
-}}
+- rewritten: the wording was dense, ambiguous, or confusing.
+- split: the card tested two or more distinct facts at once. Emit one entry in
+  sub_cards per fact, each testing exactly one idea. The client deletes the
+  original card and stores every sub-card in its place.
+- mnemonic: the content was sound but abstract or unmemorable. Keep the
+  question and answer, and add a short memory hook.
 
-Leech Cards:
-{json.dumps(cards_payload, indent=2)}
+Constraints:
+- Preserve the original factual meaning. Never introduce new claims.
+- Echo each id back exactly as given.
+- Return one result for every input id, even when you leave a card unchanged.
+- sub_cards must be empty unless action is split; new_question/new_answer must
+  be empty when action is split.
+- Answers under 25 words.
+- reason: one short sentence.
+
+Cards:
+{cards}
 """
 
-    response = model.generate_content(prompt)
-    text_resp = response.text.strip()
-    if text_resp.startswith("```json"):
-        text_resp = text_resp[7:]
-    if text_resp.endswith("```"):
-        text_resp = text_resp[:-3]
-    text_resp = text_resp.strip()
 
+def _clean_text(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _to_flashcard(item: dict) -> FlashcardOut | None:
+    question = _clean_text(item.get("question"))
+    answer = _clean_text(item.get("answer"))
+    if not question or not answer:
+        return None
+    mnemonic = _clean_text(item.get("mnemonic")) or None
+    return FlashcardOut(question=question, answer=answer, mnemonic=mnemonic)
+
+
+def _build_result(item: dict) -> RemediatedCardOut | None:
+    """Normalise one model result into the card list the client should store."""
     try:
-        data = json.loads(text_resp)
-        out = []
-        for item in data.get("remediated_cards", []):
-            out.append(RemediatedCardOut(
-                id=item["id"],
-                action=item.get("action", "rewritten"),
-                new_question=item["new_question"],
-                new_answer=item["new_answer"],
-                mnemonic=item.get("mnemonic"),
-                reason=item.get("reason", "AI agent remediation")
-            ))
-        return out
-    except Exception as e:
-        raise ValueError(f"Failed to parse Gemini JSON response for leech remediation: {e}\nResponse was: {text_resp}")
+        action = RemediationAction(item.get("action", "rewritten"))
+    except ValueError:
+        action = RemediationAction.REWRITTEN
+
+    if action is RemediationAction.SPLIT:
+        cards = [
+            card
+            for card in (_to_flashcard(sub) for sub in item.get("sub_cards") or [])
+            if card is not None
+        ]
+        # A split with nothing usable in it is a model error, not a real split.
+        if not cards:
+            return None
+        mnemonic = _clean_text(item.get("mnemonic")) or None
+    else:
+        card = _to_flashcard(
+            {"question": item.get("new_question"), "answer": item.get("new_answer")}
+        )
+        if card is None:
+            return None
+        mnemonic = _clean_text(item.get("mnemonic")) or None
+        if action is RemediationAction.MNEMONIC and mnemonic:
+            card.mnemonic = mnemonic
+        cards = [card]
+
+    return RemediatedCardOut(
+        id=item.get("id"),
+        action=action.value,
+        reason=(_clean_text(item.get("reason")) or "AI remediation")[:300],
+        cards=cards,
+        mnemonic=mnemonic,
+    )
+
+
+def remediate_leeches(
+    cards: list[LeechCardIn],
+) -> tuple[list[RemediatedCardOut], str | None]:
+    """Return (repaired cards, serving provider label).
+
+    Cards are batched so one request never exceeds the per-call cap. The
+    provider label is None when every batch was served from cache.
+    """
+    if not cards:
+        return [], None
+
+    cache = ResponseCache()
+    results: list[RemediatedCardOut] = []
+    provider: str | None = None
+
+    batch_size = max(1, settings.MAX_LEECHES_PER_CALL)
+    for start in range(0, len(cards), batch_size):
+        batch = cards[start : start + batch_size]
+        payload = json.dumps(
+            [
+                {
+                    "id": card.id,
+                    "question": card.question,
+                    "answer": card.answer,
+                    "streak": card.streak,
+                }
+                for card in batch
+            ],
+            indent=2,
+        )
+
+        cache_key_payload = json.dumps(
+            [c.model_dump() for c in batch], sort_keys=True
+        )
+        cached = cache.get("leech", cache_key_payload)
+        if cached is not None:
+            logger.info("Leech cache hit for batch of %d", len(batch))
+            results.extend(RemediatedCardOut(**item) for item in cached)
+            continue
+
+        prompt = PROMPT.format(cards=payload)
+        outcome = get_pool().generate_json(RemediationSchema, prompt)
+        provider = outcome.label
+
+        batch_results: list[dict] = []
+        valid_ids = {card.id for card in batch}
+        for item in outcome.data.get("remediated_cards", []):
+            # Drop hallucinated ids rather than creating orphan cards.
+            if item.get("id") not in valid_ids:
+                continue
+
+            out = _build_result(item)
+            if out is None:
+                continue
+
+            results.append(out)
+            batch_results.append(out.model_dump())
+
+        if batch_results:
+            cache.set("leech", cache_key_payload, batch_results)
+
+    return results, provider

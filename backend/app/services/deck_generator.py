@@ -1,59 +1,78 @@
-import json
-import google.generativeai as genai
-from app.config import settings
+"""Deck generation via the provider pool, with disk caching."""
 
-if settings.GEMINI_API_KEY:
-    genai.configure(api_key=settings.GEMINI_API_KEY)
+import logging
+
+from app.config import settings
+from app.models.schemas import DeckSchema, GeneratedCard
+from app.services.cache import ResponseCache
+from app.services.providers.pool import get_pool
+from app.services.text_utils import normalize_text, truncate_chars
+
+logger = logging.getLogger(__name__)
+
+PROMPT = """You are an expert study assistant. Convert the notes below into a
+high-yield flashcard deck.
+
+Rules:
+- One fact per card. Split anything testing multiple ideas.
+- Questions must be answerable from the answer alone.
+- Answers under 25 words, plain prose, no markdown.
+- Emit at most {max_cards} cards, prioritising the highest-yield concepts.
+- Use the deck title provided by the caller: "{title}"
+- Set mnemonic only when a short memory hook genuinely helps; otherwise null.
+
+Notes:
+{body}
+"""
+
 
 def generate_flashcard_deck(raw_text: str, title: str) -> dict:
-    if not settings.GEMINI_API_KEY:
-        # Fallback dummy deck if API key is not set (useful for local dev/testing)
-        return {
-            "title": title,
-            "cards": [
-                {
-                    "question": f"Sample Question 1 from {title}",
-                    "answer": f"Sample Answer derived from text: {raw_text[:50]}...",
-                    "mnemonic": "Remember the first 50 chars!"
-                },
-                {
-                    "question": f"Sample Question 2 from {title}",
-                    "answer": "Sample Answer 2",
-                    "mnemonic": None
-                }
-            ]
-        }
+    """Return {"title", "cards", "cached", "provider"}.
 
-    model = genai.GenerativeModel("gemini-3.5-flash")
-    prompt = f"""
-You are an expert AI study assistant. Convert the following raw study notes or document text into a concise, high-yield flashcard deck.
-Return ONLY valid JSON matching this exact structure:
-{{
-  "title": "{title}",
-  "cards": [
-    {{
-      "question": "Clear, atomic question",
-      "answer": "Concise answer",
-      "mnemonic": "Optional memory hook or null"
-    }}
-  ]
-}}
+    An identical source always hits the cache, so regenerating the same notes
+    costs zero API calls.
+    """
+    normalized = normalize_text(raw_text)
+    if not normalized:
+        raise ValueError("No content provided.")
 
-Raw Text:
-{raw_text}
-"""
-    response = model.generate_content(prompt)
-    text_resp = response.text.strip()
-    
-    # Clean markdown code blocks if present
-    if text_resp.startswith("```json"):
-        text_resp = text_resp[7:]
-    if text_resp.endswith("```"):
-        text_resp = text_resp[:-3]
-    text_resp = text_resp.strip()
+    cache = ResponseCache()
+    cached = cache.get("deck", normalized)
+    if cached is not None:
+        logger.info("Deck cache hit")
+        cached["cached"] = True
+        return cached
 
-    try:
-        data = json.loads(text_resp)
-        return data
-    except Exception as e:
-        raise ValueError(f"Failed to parse Gemini JSON response for deck generation: {e}\nResponse was: {text_resp}")
+    body = truncate_chars(normalized, settings.MAX_INPUT_CHARS)
+    prompt = PROMPT.format(max_cards=settings.MAX_CARDS, title=title, body=body)
+
+    pool = get_pool()
+    outcome = pool.generate_json(DeckSchema, prompt)
+
+    cards: list[GeneratedCard] = []
+    for item in outcome.data.get("cards", [])[: settings.MAX_CARDS]:
+        question = (item.get("question") or "").strip()
+        answer = (item.get("answer") or "").strip()
+        if not question or not answer:
+            continue
+        mnemonic = item.get("mnemonic")
+        cards.append(
+            GeneratedCard(
+                question=question,
+                answer=answer,
+                mnemonic=(mnemonic.strip() if isinstance(mnemonic, str) and mnemonic.strip() else None),
+            )
+        )
+
+    if not cards:
+        raise ValueError("The model returned no usable cards for this content.")
+
+    result = {
+        "title": (outcome.data.get("title") or title).strip(),
+        "cards": [card.model_dump() for card in cards],
+        "cached": False,
+        "provider": outcome.label,
+    }
+
+    cache.set("deck", normalized, result)
+    return result

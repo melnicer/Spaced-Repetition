@@ -1,9 +1,16 @@
-fastapi==0.110.0
-uvicorn==0.28.0
-google-generativeai==0.4.1
-pypdf==4.1.0
-pydantic==2.6.4
-python-multipart==0.0.9
-python-dotenv==1.0.1
-pytest==8.1.1
-httpx==0.27.0
+# Bounded to the major versions verified in tests. A Render rebuild should not
+# silently pick up a breaking SDK release.
+fastapi>=0.142.0,<1.0.0
+uvicorn>=0.30.0,<1.0.0
+google-genai>=2.25.0,<3.0.0
+openai>=3.22.1,<4.0.0
+pypdf>=6.19.0,<7.0.0
+pydantic>=2.13.0,<3.0.0
+python-multipart>=0.0.9
+python-dotenv>=1.0.1
+pytest>=8.1.1
+httpx>=0.27.0
+
+# Runtime deps only. Keeps the image smaller and the CVE surface smaller.
+# tenacity was used during development for retry logic that ended up living in
+# ProviderPool, so it is no longer required.

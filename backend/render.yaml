@@ -3,8 +3,25 @@ services:
     name: flutterstudy-api
     env: docker
     plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
     buildCommand: ""
     startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    # Comma-separated failover order. Retired model IDs cause a 404, which
+    # blacklists that model for the container's lifetime and fails over.
     envVars:
       - key: GEMINI_API_KEY
         sync: false
+      - key: GEMINI_MODEL_CHAIN
+        value: gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL_CHAIN
+        value: llama-3.3-70b-versatile,openai/gpt-oss-120b
+      - key: CACHE_ENABLED
+        value: "true"
+      - key: MAX_CARDS
+        value: "20"
+      - key: MAX_INPUT_CHARS
+        value: "24000"
