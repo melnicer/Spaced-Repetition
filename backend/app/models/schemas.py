@@ -117,16 +117,19 @@ class ProviderStatusOut(BaseModel):
     alias: str
     model: str
     vendor: str
-    fingerprint: str
     available: bool
     disabled: bool
     cooldown_remaining: int
     calls: int
     failures: int
     blacklisted_models: List[str]
-    last_error: str
-    last_error_kind: str
-    last_error_at: float
+    # Present only when the request supplies a valid status token. The
+    # fingerprint is 4 characters of a live API key and last_error can echo
+    # prompt content back out, so neither is served anonymously.
+    fingerprint: Optional[str] = None
+    last_error: Optional[str] = None
+    last_error_kind: Optional[str] = None
+    last_error_at: Optional[float] = None
 
 
 class StatusOut(BaseModel):
@@ -134,3 +137,6 @@ class StatusOut(BaseModel):
     providers: List[ProviderStatusOut]
     cache_hits: int
     cache_misses: int
+    # False means fingerprints and error text were withheld because the
+    # request had no valid token, not that nothing is wrong.
+    detailed: bool = False

@@ -5,6 +5,7 @@ import asyncio
 import pytest
 from pydantic import BaseModel
 
+from app.config import settings
 from app.services.providers import pool as pool_module
 from app.services.providers.base import (
     AllProvidersExhausted,
@@ -250,6 +251,75 @@ def test_503_message_containing_400_is_not_classified_permanent():
         status = 503
 
     assert isinstance(_translate(UpstreamError("503 upstream: 400 capacity")), TransientError)
+
+
+def test_exhausted_transient_triggers_cooldown(monkeypatch):
+    """A model that burned all its retries is overloaded, not broken.
+
+    Without a cooldown every subsequent request re-runs the same doomed
+    retry ladder, which is what a 503 demand spike looks like in practice.
+    """
+    monkeypatch.setattr(settings, "TRANSIENT_COOLDOWN_SECONDS", 30)
+
+    class AlwaysTransient(StubProvider):
+        def generate_json(self, schema, prompt, max_output_tokens):
+            self.calls += 1
+            raise TransientError("503 UNAVAILABLE high demand")
+
+    first = AlwaysTransient("projA", "gemini-3.6-flash")
+    second = StubProvider("projB", "gemini-3.5-flash-lite")
+    pool = ProviderPool([first, second])
+
+    run(pool.generate_json(Out, "prompt"))
+    assert first.calls == 3, "initial attempt plus two retries"
+    assert first.status.cooldown_remaining > 0
+    assert first.status.available is False
+
+    # The next request must not re-run the retry ladder on the same model.
+    run(pool.generate_json(Out, "prompt"))
+    assert first.calls == 3, "cooled-down provider must be skipped entirely"
+    assert second.calls == 2
+
+
+def test_transient_cooldown_is_jittered(monkeypatch):
+    """Identical cooldowns would resynchronise the clients that caused them."""
+    monkeypatch.setattr(settings, "TRANSIENT_COOLDOWN_SECONDS", 30)
+
+    values = {pool_module._transient_cooldown() for _ in range(40)}
+    assert len(values) > 1, "cooldown must not be a constant"
+    assert all(30 <= value <= 37 for value in values)
+
+
+def test_transient_cooldown_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(settings, "TRANSIENT_COOLDOWN_SECONDS", 0)
+
+    class AlwaysTransient(StubProvider):
+        def generate_json(self, schema, prompt, max_output_tokens):
+            self.calls += 1
+            raise TransientError("503 boom")
+
+    first = AlwaysTransient("projA", "m1")
+    pool = ProviderPool([first, StubProvider("projB", "m2")])
+
+    run(pool.generate_json(Out, "prompt"))
+    assert first.status.cooldown_remaining == 0
+
+
+def test_permanent_error_does_not_trigger_cooldown(monkeypatch):
+    """A permanent rejection says nothing about current load.
+
+    Cooling down here would wrongly penalise a model that is perfectly
+    healthy and simply disliked one particular request.
+    """
+    monkeypatch.setattr(settings, "TRANSIENT_COOLDOWN_SECONDS", 30)
+
+    first = StubProvider("projA", "m1", behaviour=PermanentError("400 bad schema"))
+    pool = ProviderPool([first, StubProvider("projB", "m2")])
+
+    run(pool.generate_json(Out, "prompt"))
+
+    assert first.status.cooldown_remaining == 0
+    assert first.status.available is True
 
 
 def test_all_providers_failing_raises_typed_error_with_retry_info():

@@ -45,6 +45,12 @@ class Settings:
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     GROQ_BASE_URL: str = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 
+    # --- Status endpoint access ---
+    # When set, /api/status requires "X-Status-Token" and stops publishing
+    # credential fingerprints. When unset it still works, but only ever
+    # returns redacted diagnostics, so an unconfigured deploy is safe.
+    STATUS_TOKEN: str = os.getenv("STATUS_TOKEN", "")
+
     # --- Models (env-driven so deprecations never require a code push) ---
     GEMINI_MODEL_CHAIN: list[str] = _split(os.getenv("GEMINI_MODEL_CHAIN")) or [
         "gemini-3.6-flash",
@@ -56,6 +62,10 @@ class Settings:
         "llama-3.3-70b-versatile",
         "openai/gpt-oss-120b",
     ]
+
+    # How long to cool a model after it burns all its transient retries.
+    # 0 disables cooldown and makes the pool fail over on every request.
+    TRANSIENT_COOLDOWN_SECONDS: int = int(os.getenv("TRANSIENT_COOLDOWN_SECONDS", "30"))
 
     # --- Limits ---
     MAX_INPUT_CHARS: int = int(os.getenv("MAX_INPUT_CHARS", "24000"))

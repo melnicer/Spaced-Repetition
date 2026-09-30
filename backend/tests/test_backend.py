@@ -5,6 +5,7 @@ The provider pool is stubbed, so these tests never touch the network.
 
 import asyncio
 import inspect
+import json
 from inspect import iscoroutinefunction
 
 import pytest
@@ -94,6 +95,41 @@ def fake_pool(monkeypatch):
     return pool
 
 
+@pytest.fixture
+def real_provider_pool(monkeypatch):
+    """A pool holding one genuine provider, for status-endpoint tests.
+
+    The redaction tests need a provider with a real fingerprint and error
+    text. FakePool has no providers, so it cannot prove anything about what
+    the endpoint withholds.
+    """
+    from app.services.providers import pool as pool_module
+    from app.services.providers.base import Provider, TransientError
+
+    class RecordingProvider(Provider):
+        vendor = "gemini"
+
+        def generate_json(self, schema, prompt, max_output_tokens):
+            raise TransientError("503 UNAVAILABLE")
+
+    provider = RecordingProvider(
+        alias="gemini-default",
+        model="gemini-3.6-flash",
+        api_key="fake-key-abcd",
+    )
+    pool = pool_module.ProviderPool([provider])
+    # Seed the state the endpoint reports. Driving it through a real request
+    # would spend the retry sleeps here for no extra coverage, since the
+    # cooldown behaviour is tested in test_provider_pool.py.
+    provider.status.calls = 1
+    provider.status.note_error(
+        "TransientError", "503 UNAVAILABLE: prompt echo SECRET_DOC_TEXT"
+    )
+    monkeypatch.setattr("app.routers.health.get_pool", lambda: pool)
+    _force_configured(monkeypatch, True)
+    return pool
+
+
 def test_health():
     response = client.get("/health")
     assert response.status_code == 200
@@ -164,6 +200,70 @@ def test_status_never_leaks_full_keys(fake_pool):
     assert response.status_code == 200
     text = response.text
     assert "fake-key" not in text
+
+
+def test_status_redacts_fingerprint_and_error_text_when_token_unset(
+    real_provider_pool, monkeypatch
+):
+    """An unauthenticated caller must not get any of the diagnostic detail.
+
+    The fingerprint is 4 characters of a live API key and last_error can
+    echo prompt content from the request that failed. Both were previously
+    served to anyone who opened the URL.
+    """
+    monkeypatch.setattr(settings, "STATUS_TOKEN", "")
+
+    response = client.get("/api/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["detailed"] is False
+
+    for provider in body["providers"]:
+        assert provider.get("fingerprint") is None
+        assert provider.get("last_error") is None
+        assert provider.get("last_error_kind") is None
+        assert provider.get("last_error_at") is None
+        # Health signals stay available so a redacted response is still useful.
+        assert "available" in provider
+        assert "model" in provider
+
+    assert "fake-key" not in response.text
+    # The last 4 characters of the key must not leak either.
+    assert "abcd" not in response.text
+    # Nor may upstream error text echo prompt content back to the caller.
+    assert "SECRET_DOC_TEXT" not in response.text
+
+
+def test_status_returns_detail_with_valid_token(real_provider_pool, monkeypatch):
+    monkeypatch.setattr(settings, "STATUS_TOKEN", "s3cret-debug-token")
+
+    response = client.get(
+        "/api/status", headers={"X-Status-Token": "s3cret-debug-token"}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["detailed"] is True
+    assert body["providers"][0]["fingerprint"] == "abcd"
+    assert "SECRET_DOC_TEXT" in body["providers"][0]["last_error"]
+
+
+def test_status_ignores_wrong_token(real_provider_pool, monkeypatch):
+    """A bad token must not silently fall back to full detail."""
+    monkeypatch.setattr(settings, "STATUS_TOKEN", "s3cret-debug-token")
+
+    for bad in ("wrong", "s3cret-debug-toke", "s3cret-debug-tokenx", ""):
+        body = client.get("/api/status", headers={"X-Status-Token": bad}).json()
+        assert body["detailed"] is False, f"token {bad!r} should not authenticate"
+        assert body["providers"][0].get("fingerprint") is None
+        assert "SECRET_DOC_TEXT" not in json.dumps(body)
+
+
+def test_status_does_not_expose_token_itself(real_provider_pool, monkeypatch):
+    monkeypatch.setattr(settings, "STATUS_TOKEN", "s3cret-debug-token")
+    response = client.get(
+        "/api/status", headers={"X-Status-Token": "s3cret-debug-token"}
+    )
+    assert "s3cret-debug-token" not in response.text
 
 
 def test_generate_returns_cards_and_metadata(fake_pool):

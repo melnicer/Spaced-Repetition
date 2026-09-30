@@ -19,6 +19,15 @@ services:
         sync: false
       - key: GROQ_MODEL_CHAIN
         value: llama-3.3-70b-versatile,openai/gpt-oss-120b
+      # Unlocks fingerprints and raw error text on /api/status. Without it the
+      # endpoint still answers, but withholds both. Set this in the dashboard
+      # to a random string; do not commit a real token here.
+      - key: STATUS_TOKEN
+        sync: false
+      # Cool a model for this long after it burns all its transient retries,
+      # so a demand spike is not re-attempted by every request in turn.
+      - key: TRANSIENT_COOLDOWN_SECONDS
+        value: "30"
       - key: CACHE_ENABLED
         value: "true"
       - key: MAX_CARDS

@@ -119,22 +119,31 @@ class ProviderStatus:
     def available(self) -> bool:
         return not self.disabled and self.cooldown_remaining == 0
 
-    def to_dict(self) -> dict:
-        return {
+    def to_dict(self, detailed: bool = True) -> dict:
+        """Serialise for the status endpoint.
+
+        `detailed=False` drops the credential fingerprint and the raw upstream
+        error text. Both were published on an unauthenticated URL: the
+        fingerprint is 4 characters of a live API key, and the error text can
+        echo back prompt content from the request that failed.
+        """
+        payload = {
             "alias": self.alias,
             "model": self.model,
             "vendor": self.vendor,
-            "fingerprint": self.fingerprint,
             "available": self.available,
             "disabled": self.disabled,
             "cooldown_remaining": self.cooldown_remaining,
             "calls": self.calls,
             "failures": self.failures,
             "blacklisted_models": self.blacklisted_models,
-            "last_error": self.last_error,
-            "last_error_kind": self.last_error_kind,
-            "last_error_at": self.last_error_at,
         }
+        if detailed:
+            payload["fingerprint"] = self.fingerprint
+            payload["last_error"] = self.last_error
+            payload["last_error_kind"] = self.last_error_kind
+            payload["last_error_at"] = self.last_error_at
+        return payload
 
 
 class Provider:
@@ -164,5 +173,5 @@ class Provider:
     def generate_json(self, schema: type[BaseModel], prompt: str, max_output_tokens: int) -> dict:
         raise NotImplementedError
 
-    def status_dict(self) -> dict:
-        return self.status.to_dict()
+    def status_dict(self, detailed: bool = True) -> dict:
+        return self.status.to_dict(detailed=detailed)

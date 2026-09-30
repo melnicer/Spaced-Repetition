@@ -6,6 +6,7 @@ narrow reaction so a single flaky key never blocks the whole app.
 
 import asyncio
 import logging
+import random
 import time
 
 from pydantic import BaseModel
@@ -30,6 +31,18 @@ logger = logging.getLogger(__name__)
 
 # Blacklisted models are remembered for the container's lifetime.
 _BLACKLISTED: set[str] = set()
+
+
+def _transient_cooldown() -> int:
+    """Seconds to cool a model down after it exhausts its transient retries.
+
+    Jittered so several clients that tripped the same 503 do not all return
+    at the same instant and reproduce the spike.
+    """
+    base = settings.TRANSIENT_COOLDOWN_SECONDS
+    if base <= 0:
+        return 0
+    return base + random.randint(0, max(1, base // 4))
 
 
 def build_providers() -> list[Provider]:
@@ -245,7 +258,18 @@ class ProviderPool:
                             "detail": str(locals().get("last", exc))[:200],
                         }
                     )
-                    logger.warning("Transient failures on %s, advancing", label)
+                    # A model that has just failed every retry is overloaded,
+                    # not broken. Google's own 503 wording says the spike is
+                    # usually temporary, so cool it briefly and let the next
+                    # request start elsewhere instead of re-running the same
+                    # doomed retry ladder.
+                    cooldown = _transient_cooldown()
+                    if cooldown > 0:
+                        provider.status.cooldown_until = time.time() + cooldown
+                        cooldown_times.append(cooldown)
+                    logger.warning(
+                        "Transient failures on %s, cooling down %ss", label, cooldown
+                    )
                 except ProviderError as exc:
                     attempts.append(
                         {
@@ -261,8 +285,8 @@ class ProviderPool:
             retry_after=min(cooldown_times) if cooldown_times else None,
         )
 
-    def status(self) -> list[dict]:
-        return [provider.status_dict() for provider in self._providers]
+    def status(self, detailed: bool = True) -> list[dict]:
+        return [p.status_dict(detailed=detailed) for p in self._providers]
 
     reset_blacklist = staticmethod(reset_blacklist)
 
