@@ -151,6 +151,150 @@ def test_service_functions_are_coroutines():
     )
 
 
+def test_leech_remediation_actually_awaits_the_pool(monkeypatch):
+    """The deck path has this canary; the leech path needs its own.
+
+    The original production bug lived on this exact line, and the leech
+    schema is the more complex of the two (action, sub_cards, new_question).
+    A declared-async-but-unawaited service would pass every test that did
+    not drive a real suspension point through it.
+    """
+    completed = False
+
+    class YieldingPool:
+        async def generate_json(self, schema, prompt, max_output_tokens=2048):
+            nonlocal completed
+            await asyncio.sleep(0)  # real suspension point
+            completed = True
+            return ProviderResult(
+                {
+                    "remediated_cards": [
+                        {
+                            "id": "card-1",
+                            "action": "rewritten",
+                            "reason": "Dense wording",
+                            "new_question": "Simpler question?",
+                            "new_answer": "Simpler answer.",
+                            "sub_cards": [],
+                        }
+                    ]
+                },
+                "projA/gemini-3.6-flash",
+            )
+
+    monkeypatch.setattr("app.services.leech_agent.get_pool", lambda: YieldingPool())
+    _force_configured(monkeypatch, True)
+
+    response = client.post(
+        "/api/leech/remediate",
+        json={
+            "cards": [
+                {"id": "card-1", "question": "Dense question?", "answer": "Dense answer."}
+            ]
+        },
+    )
+
+    assert completed is True, "the pool coroutine was never awaited on the leech path"
+    assert response.status_code == 200
+    body = response.json()
+    assert body["provider"] == "projA/gemini-3.6-flash"
+    assert body["remediated_cards"][0]["cards"][0]["question"] == "Simpler question?"
+
+
+def test_leech_remediation_normalises_a_split(monkeypatch):
+    """A split must yield N cards to store in place of the original.
+
+    The client deletes the original and stores every sub-card, so the
+    normalisation in leech_agent._build_result is what the app depends on.
+    """
+    class SplitPool:
+        async def generate_json(self, schema, prompt, max_output_tokens=2048):
+            return ProviderResult(
+                {
+                    "remediated_cards": [
+                        {
+                            "id": "card-1",
+                            "action": "split",
+                            "reason": "Two facts in one",
+                            "new_question": "",
+                            "new_answer": "",
+                            "sub_cards": [
+                                {"question": "Fact one?", "answer": "One."},
+                                {"question": "Fact two?", "answer": "Two."},
+                                # Unusable entry: must be dropped, not stored.
+                                {"question": "", "answer": ""},
+                            ],
+                        },
+                        # Hallucinated id: must be dropped, never become a card.
+                        {
+                            "id": "ghost-999",
+                            "action": "rewritten",
+                            "reason": "Invented",
+                            "new_question": "Q?",
+                            "new_answer": "A.",
+                            "sub_cards": [],
+                        },
+                    ]
+                },
+                "projA/gemini-3.6-flash",
+            )
+
+    monkeypatch.setattr("app.services.leech_agent.get_pool", lambda: SplitPool())
+    _force_configured(monkeypatch, True)
+
+    response = client.post(
+        "/api/leech/remediate",
+        json={
+            "cards": [
+                {"id": "card-1", "question": "Q1 and Q2?", "answer": "A1 and A2."}
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    remediated = response.json()["remediated_cards"]
+    assert len(remediated) == 1, "the hallucinated id must not come back"
+    split = remediated[0]
+    assert split["action"] == "split"
+    assert len(split["cards"]) == 2, "the empty sub_card must be dropped"
+
+
+def test_leech_remediation_drops_a_split_with_no_usable_subcards(monkeypatch):
+    """A split that produces nothing usable is a model error, not a split.
+
+    Returning it would make the client delete the original card and insert
+    nothing, silently destroying the user's card.
+    """
+    class EmptySplitPool:
+        async def generate_json(self, schema, prompt, max_output_tokens=2048):
+            return ProviderResult(
+                {
+                    "remediated_cards": [
+                        {
+                            "id": "card-1",
+                            "action": "split",
+                            "reason": "Tried to split",
+                            "new_question": "",
+                            "new_answer": "",
+                            "sub_cards": [{"question": "", "answer": ""}],
+                        }
+                    ]
+                },
+                "projA/gemini-3.6-flash",
+            )
+
+    monkeypatch.setattr("app.services.leech_agent.get_pool", lambda: EmptySplitPool())
+    _force_configured(monkeypatch, True)
+
+    response = client.post(
+        "/api/leech/remediate",
+        json={"cards": [{"id": "card-1", "question": "Q?", "answer": "A."}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["remediated_cards"] == []
+
+
 def test_deck_generation_actually_awaits_the_pool(monkeypatch):
     """Proves the await happens, not merely that the function is async.
 
