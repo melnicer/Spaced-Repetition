@@ -45,6 +45,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.get("/")
+def root():
+    """Liveness probe that also tells you where to look next.
+
+    The bare domain used to 404, which was indistinguishable from the
+    service being down. /health stays the machine-readable check.
+    """
+    return {
+        "service": "FlutterStudy API",
+        "version": app.version,
+        "docs": "/docs",
+        "health": "/health",
+        "status": "/api/status",
+    }
+
 app.include_router(health.router)
 app.include_router(deck.router)
 app.include_router(leech.router)
