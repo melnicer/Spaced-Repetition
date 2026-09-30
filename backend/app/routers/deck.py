@@ -67,7 +67,7 @@ async def generate_deck(
         )
 
     try:
-        return generate_flashcard_deck(raw_content, title)
+        return await generate_flashcard_deck(raw_content, title)
     except AllProvidersExhausted as exc:
         return to_http_response(exc)
     except ValueError as exc:

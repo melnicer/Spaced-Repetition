@@ -26,7 +26,7 @@ Notes:
 """
 
 
-def generate_flashcard_deck(raw_text: str, title: str) -> dict:
+async def generate_flashcard_deck(raw_text: str, title: str) -> dict:
     """Return {"title", "cards", "cached", "provider"}.
 
     An identical source always hits the cache, so regenerating the same notes
@@ -47,7 +47,7 @@ def generate_flashcard_deck(raw_text: str, title: str) -> dict:
     prompt = PROMPT.format(max_cards=settings.MAX_CARDS, title=title, body=body)
 
     pool = get_pool()
-    outcome = pool.generate_json(DeckSchema, prompt)
+    outcome = await pool.generate_json(DeckSchema, prompt)
 
     cards: list[GeneratedCard] = []
     for item in outcome.data.get("cards", [])[: settings.MAX_CARDS]:

@@ -91,7 +91,7 @@ def _build_result(item: dict) -> RemediatedCardOut | None:
     )
 
 
-def remediate_leeches(
+async def remediate_leeches(
     cards: list[LeechCardIn],
 ) -> tuple[list[RemediatedCardOut], str | None]:
     """Return (repaired cards, serving provider label).
@@ -132,7 +132,7 @@ def remediate_leeches(
             continue
 
         prompt = PROMPT.format(cards=payload)
-        outcome = get_pool().generate_json(RemediationSchema, prompt)
+        outcome = await get_pool().generate_json(RemediationSchema, prompt)
         provider = outcome.label
 
         batch_results: list[dict] = []

@@ -3,11 +3,17 @@
 The provider pool is stubbed, so these tests never touch the network.
 """
 
+import asyncio
+import inspect
+from inspect import iscoroutinefunction
+
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
 from app.config import settings
+from app.services.deck_generator import generate_flashcard_deck
+from app.services.leech_agent import remediate_leeches
 from app.services.providers.base import AllProvidersExhausted, ProviderResult
 
 client = TestClient(app)
@@ -50,11 +56,18 @@ class FakePool:
         self.label = label
         self.calls = 0
 
-    def generate_json(self, schema, prompt, max_output_tokens=2048):
+    def generate_json_sync(self, schema, prompt, max_output_tokens=2048):
+        """Synchronous core, shared by the async wrapper."""
         self.calls += 1
         if self.error is not None:
             raise self.error
         return ProviderResult(self.payload, self.label)
+
+    # Must stay async: the real ProviderPool.generate_json is `async def`.
+    # A sync fake here would let sync/async drift ship unnoticed, which is
+    # exactly the bug this fake was previously hiding.
+    async def generate_json(self, schema, prompt, max_output_tokens=2048):
+        return self.generate_json_sync(schema, prompt, max_output_tokens)
 
 
 def _force_configured(monkeypatch, value: bool = True) -> None:
@@ -85,6 +98,56 @@ def test_health():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "service": "FlutterStudy API"}
+
+
+def test_service_functions_are_coroutines():
+    """Canary for sync/async drift.
+
+    The pool is async. If either service stops awaiting it, every real AI
+    call fails at runtime with "coroutine object has no attribute 'data'"
+    while an HTTP test using a synchronous fake still passes.
+    """
+    assert iscoroutinefunction(generate_flashcard_deck), (
+        "generate_flashcard_deck must be async: it awaits the async provider pool"
+    )
+    assert iscoroutinefunction(remediate_leeches), (
+        "remediate_leeches must be async: it awaits the async provider pool"
+    )
+
+
+def test_deck_generation_actually_awaits_the_pool(monkeypatch):
+    """Proves the await happens, not merely that the function is async.
+
+    The stub yields to the event loop before returning. A service that is
+    declared async but forgets to await would still hand a coroutine to
+    `.data` and fail here.
+    """
+    completed = False
+
+    class YieldingPool:
+        async def generate_json(self, schema, prompt, max_output_tokens=2048):
+            nonlocal completed
+            await asyncio.sleep(0)  # real suspension point
+            completed = True
+            return ProviderResult(
+                {"title": "Async", "cards": [{"question": "q", "answer": "a"}]},
+                "projA/gemini-3.6-flash",
+            )
+
+    monkeypatch.setattr(
+        "app.services.deck_generator.get_pool", lambda: YieldingPool()
+    )
+    _force_configured(monkeypatch, True)
+
+    response = client.post(
+        "/api/deck/generate",
+        data={"title": "Async", "text": "Plants absorb carbon dioxide."},
+    )
+
+    assert completed is True, "the pool coroutine was never awaited"
+    assert response.status_code == 200
+    assert response.json()["cards"][0]["question"] == "q"
+    assert response.json()["provider"] == "projA/gemini-3.6-flash"
 
 
 def test_status_reports_unconfigured_without_keys():

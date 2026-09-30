@@ -18,7 +18,7 @@ router = APIRouter(prefix="/api/leech", tags=["Leeches"])
 
 
 @router.post("/remediate", response_model=RemediateLeechesResponse)
-def remediate(payload: RemediateLeechesRequest):
+async def remediate(payload: RemediateLeechesRequest):
     if not payload.cards:
         raise HTTPException(status_code=400, detail="No leech cards provided.")
 
@@ -37,7 +37,7 @@ def remediate(payload: RemediateLeechesRequest):
         )
 
     try:
-        remediated, provider = remediate_leeches(payload.cards)
+        remediated, provider = await remediate_leeches(payload.cards)
         return RemediateLeechesResponse(remediated_cards=remediated, provider=provider)
     except AllProvidersExhausted as exc:
         return to_http_response(exc)
