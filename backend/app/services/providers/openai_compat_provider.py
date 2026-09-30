@@ -62,11 +62,12 @@ class OpenAICompatProvider(Provider):
                 text = text[:-3]
             return json.loads(text.strip())
         except json.JSONDecodeError as exc:
-            self.status.failures += 1
+            self.status.note_error("invalid_json", f"Invalid JSON from {self.model}: {exc}")
             raise ProviderError(f"Invalid JSON from {self.model}: {exc}") from exc
         except Exception as exc:
-            self.status.failures += 1
-            raise self._translate(exc) from exc
+            error = self._translate(exc)
+            self.status.note_error(type(error).__name__, str(error))
+            raise error from exc
 
     @staticmethod
     def _translate(exc: Exception) -> ProviderError:

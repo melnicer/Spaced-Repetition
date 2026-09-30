@@ -124,6 +124,9 @@ class ProviderStatusOut(BaseModel):
     calls: int
     failures: int
     blacklisted_models: List[str]
+    last_error: str
+    last_error_kind: str
+    last_error_at: float
 
 
 class StatusOut(BaseModel):

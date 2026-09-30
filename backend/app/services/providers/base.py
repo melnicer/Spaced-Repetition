@@ -34,6 +34,16 @@ class TransientError(ProviderError):
     """5xx, timeouts, connection resets - worth retrying on the same provider."""
 
 
+class PermanentError(ProviderError):
+    """The request itself is unacceptable, so retrying cannot help.
+
+    400 INVALID_ARGUMENT, malformed schema, and safety blocks land here.
+    These used to be classified TransientError, which made the pool burn
+    three calls and ~4.5s of sleep on an error that was never going to
+    succeed, then advance as if the provider were merely unhealthy.
+    """
+
+
 class PromptTooLarge(ProviderError):
     """Request exceeds this provider's token window; skip rather than fail."""
 
@@ -87,6 +97,18 @@ class ProviderStatus:
     calls: int = 0
     failures: int = 0
     blacklisted_models: list[str] = field(default_factory=list)
+    # Truncated upstream text. Without this, a provider failing 3/3 looks
+    # identical whether the cause is a safety block, a bad schema, or a 500,
+    # and there is no way to tell from outside which one it is.
+    last_error: str = ""
+    last_error_kind: str = ""
+    last_error_at: float = 0.0
+
+    def note_error(self, kind: str, message: str) -> None:
+        self.failures += 1
+        self.last_error = message[:300]
+        self.last_error_kind = kind
+        self.last_error_at = time.time()
 
     @property
     def cooldown_remaining(self) -> int:
@@ -109,6 +131,9 @@ class ProviderStatus:
             "calls": self.calls,
             "failures": self.failures,
             "blacklisted_models": self.blacklisted_models,
+            "last_error": self.last_error,
+            "last_error_kind": self.last_error_kind,
+            "last_error_at": self.last_error_at,
         }
 
 

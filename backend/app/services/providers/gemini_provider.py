@@ -10,6 +10,7 @@ from app.config import settings
 from app.services.providers.base import (
     AuthFailed,
     ModelNotFound,
+    PermanentError,
     Provider,
     ProviderError,
     QuotaExceeded,
@@ -41,14 +42,33 @@ def _translate(exc: Exception) -> ProviderError:
     text = str(exc)
     lowered = text.lower()
 
-    if status == 429 or "resource_exhausted" in lowered or "429" in lowered:
+    # A real status code is authoritative. The substring fallbacks below are
+    # for SDK exceptions that omit it, and a bare "400" inside a 503 message
+    # would otherwise misclassify the response.
+    if status is not None:
+        if status == 429:
+            return QuotaExceeded(text, retry_after=_retry_after(exc))
+        if status == 404:
+            return ModelNotFound(text)
+        if status in (401, 403):
+            return AuthFailed(text)
+        if 500 <= status < 600:
+            return TransientError(text)
+        if 400 <= status < 500:
+            return PermanentError(text)
+
+    if "resource_exhausted" in lowered or "rate limit" in lowered or "429" in lowered:
         return QuotaExceeded(text, retry_after=_retry_after(exc))
-    if status == 404 or "not found" in lowered or "404" in lowered:
+    if "not found" in lowered or "404" in lowered or "is not supported" in lowered:
         return ModelNotFound(text)
-    if status in (401, 403) or "permission" in lowered or "api key" in lowered:
+    if "permission" in lowered or "api key" in lowered or "unauthenticated" in lowered:
         return AuthFailed(text)
-    if status is not None and 500 <= status < 600:
-        return TransientError(text)
+    # Checked before the generic fallbacks: a safety block or bad argument is
+    # a permanent rejection, and retrying it only delays the failover.
+    if "safety" in lowered or "blocked" in lowered or "prohibited_content" in lowered:
+        return PermanentError(text)
+    if "invalid_argument" in lowered or "invalid argument" in lowered:
+        return PermanentError(text)
     if "timeout" in lowered or "deadline" in lowered or "connection" in lowered:
         return TransientError(text)
     return TransientError(text)
@@ -85,8 +105,9 @@ class GeminiProvider(Provider):
                 text = text[:-3]
             return json.loads(text.strip())
         except json.JSONDecodeError as exc:
-            self.status.failures += 1
+            self.status.note_error("invalid_json", f"Invalid JSON from {self.model}: {exc}")
             raise ProviderError(f"Invalid JSON from {self.model}: {exc}") from exc
         except Exception as exc:
-            self.status.failures += 1
-            raise _translate(exc) from exc
+            error = _translate(exc)
+            self.status.note_error(type(error).__name__, str(error))
+            raise error from exc

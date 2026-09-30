@@ -10,6 +10,7 @@ from app.services.providers.base import (
     AllProvidersExhausted,
     AuthFailed,
     ModelNotFound,
+    PermanentError,
     Provider,
     QuotaExceeded,
     TransientError,
@@ -142,6 +143,113 @@ def test_transient_error_recovers_on_retry():
     result = run(pool.generate_json(Out, "prompt"))
     assert result.data == {"value": "recovered"}
     assert flaky.calls == 2
+
+
+def test_permanent_error_does_not_burn_retries():
+    """A request the provider rejected on its merits must not be retried.
+
+    This is the shape of the real gemini-3.6-flash failure: 3 calls, 3
+    failures, then failover. Retrying a permanent rejection costs ~4.5s of
+    sleep per provider and makes a healthy provider look broken.
+    """
+    first = StubProvider("projA", "gemini-3.6-flash", behaviour=PermanentError("400 invalid argument"))
+    second = StubProvider("projB", "gemini-3.5-flash-lite")
+    pool = ProviderPool([first, second])
+
+    result = run(pool.generate_json(Out, "prompt"))
+
+    assert result.data == {"value": "from-projB"}
+    assert first.calls == 1, "a permanent error must be attempted exactly once"
+    assert second.calls == 1
+
+
+def test_permanent_error_during_retry_stops_immediately():
+    """A retry that turns permanent must not consume remaining attempts."""
+
+    class FlakyProvider(StubProvider):
+        def generate_json(self, schema, prompt, max_output_tokens):
+            self.calls += 1
+            if self.calls == 1:
+                raise TransientError("500 boom")
+            raise PermanentError("400 invalid argument")
+
+    flaky = FlakyProvider("flaky", "gemini-3.6-flash")
+    fallback = StubProvider("projB", "gemini-3.5-flash-lite")
+    pool = ProviderPool([flaky, fallback])
+
+    result = run(pool.generate_json(Out, "prompt"))
+
+    assert result.data == {"value": "from-projB"}
+    assert flaky.calls == 2, "should stop after the first permanent reply"
+    assert fallback.calls == 1
+
+
+def test_all_permanent_failures_report_reason():
+    first = StubProvider("projA", "m1", behaviour=PermanentError("400 invalid argument"))
+    pool = ProviderPool([first])
+
+    with pytest.raises(AllProvidersExhausted) as info:
+        run(pool.generate_json(Out, "prompt"))
+
+    assert {item["reason"] for item in info.value.attempts} == {"permanent_error"}
+    assert first.calls == 1
+
+
+def test_safety_block_is_permanent_not_transient():
+    """Regression: a safety block was classified transient and retried."""
+    from app.services.providers.gemini_provider import _translate
+
+    class Blocked(Exception):
+        pass
+
+    assert isinstance(_translate(Blocked("Response was blocked by safety filters")), PermanentError)
+    assert isinstance(_translate(Blocked("400 INVALID_ARGUMENT: bad schema")), PermanentError)
+    assert isinstance(_translate(Blocked("503 service unavailable")), TransientError)
+    assert isinstance(_translate(Blocked("429 resource exhausted")), QuotaExceeded)
+
+
+def test_status_records_last_error_for_diagnosis():
+    """A provider failing 3/3 must say why, not just how often.
+
+    Uses a real GeminiProvider whose SDK call is patched to raise, so the
+    recording path under test is the one production actually takes. A bare
+    stub would skip it and prove nothing.
+    """
+    from app.services.providers import gemini_provider as gemini_module
+
+    class UpstreamError(Exception):
+        status = 400
+
+    provider = gemini_module.GeminiProvider(
+        alias="gemini-default", model="gemini-3.6-flash", api_key="fake-key-abcd"
+    )
+
+    class FakeModels:
+        def generate_content(self, *args, **kwargs):
+            raise UpstreamError("400 INVALID_ARGUMENT: bad response schema")
+
+    provider._client = type("FakeClient", (), {"models": FakeModels()})()
+    pool = ProviderPool([provider])
+
+    with pytest.raises(AllProvidersExhausted):
+        run(pool.generate_json(Out, "prompt"))
+
+    payload = provider.status_dict()
+    assert "INVALID_ARGUMENT" in payload["last_error"]
+    assert payload["last_error_kind"] == "PermanentError"
+    assert payload["last_error_at"] > 0
+    # One attempt only: a permanent rejection must not be retried.
+    assert provider.status.calls == 1
+
+
+def test_503_message_containing_400_is_not_classified_permanent():
+    """Regression: substring matching on '400' inside a 503 body."""
+    from app.services.providers.gemini_provider import _translate
+
+    class UpstreamError(Exception):
+        status = 503
+
+    assert isinstance(_translate(UpstreamError("503 upstream: 400 capacity")), TransientError)
 
 
 def test_all_providers_failing_raises_typed_error_with_retry_info():

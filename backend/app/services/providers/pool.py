@@ -15,6 +15,7 @@ from app.services.providers.base import (
     AllProvidersExhausted,
     AuthFailed,
     ModelNotFound,
+    PermanentError,
     PromptTooLarge,
     Provider,
     ProviderError,
@@ -205,6 +206,18 @@ class ProviderPool:
                             "detail": str(exc)[:200],
                         }
                     )
+                except PermanentError as exc:
+                    # Retrying a request the provider has already rejected on
+                    # its merits cannot help. Fail over immediately.
+                    attempts.append(
+                        {
+                            "alias": provider.alias,
+                            "model": provider.model,
+                            "reason": "permanent_error",
+                            "detail": str(exc)[:200],
+                        }
+                    )
+                    logger.warning("Permanent failure on %s, advancing: %s", label, exc)
                 except TransientError as exc:
                     # Two quick retries on the same provider, then move on.
                     for attempt in range(2):
@@ -215,6 +228,13 @@ class ProviderPool:
                             )
                             logger.info("LLM request served by %s after retry", label)
                             return ProviderResult(result, label)
+                        except PermanentError:
+                            # A retry that comes back permanently rejected
+                            # means the original failure was misclassified.
+                            # Stop retrying this provider and let the outer
+                            # handler record it and fail over.
+                            last = exc
+                            break
                         except ProviderError as retry_exc:
                             last = retry_exc
                     attempts.append(
